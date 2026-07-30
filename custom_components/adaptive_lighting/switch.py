@@ -641,16 +641,27 @@ def _expand_light_groups(
             group = state.attributes["entity_id"]
             pending.extend(group)
             _LOGGER.debug("Expanded %s to %s", light, group)
+        elif state.attributes.get("adaptive_lighting_skip_group"):
+            # Skipped group: expand to children for manual-control tracking,
+            # but record mapping so adaptation can redirect to the group entity.
+            children = state.attributes.get("entity_id", [])
+            all_lights.update(children)
+            for child in children:
+                manager._skipped_group_children[child] = light
+            _LOGGER.debug("Expanded skipped group %s to %s for tracking", light, children)
         else:
             all_lights.add(light)
     return sorted(all_lights)
 
 
 def _is_light_group(state: State) -> bool:
-    return "entity_id" in state.attributes and not state.attributes.get(
-        "is_hue_group",
-        False,
+    is_group = "entity_id" in state.attributes
+    if not is_group:
+        return False
+    skip = state.attributes.get("is_hue_group", False) or state.attributes.get(
+        "adaptive_lighting_skip_group", False
     )
+    return is_group and not skip
 
 
 def _supported_features(hass: HomeAssistant, light: str) -> set[str]:
@@ -1408,6 +1419,20 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             _LOGGER.debug("%s: '%s' is locked", self._name, light)
             return
 
+        # If this light is a child of a skipped group, redirect adaptation to the group entity.
+        # This preserves the group's internal brightness curves (e.g. Lightener).
+        if light in self.manager._skipped_group_children:
+            group_entity = self.manager._skipped_group_children[light]
+            # Avoid redundant group adaptations in the same cycle
+            if hasattr(self.manager, '_last_adapted_group') and self.manager._last_adapted_group == group_entity:
+                _LOGGER.debug("Skipping redundant adaptation for %s (group %s already adapted)", light, group_entity)
+                return
+            _LOGGER.debug("Redirecting adaptation of %s to skipped group %s", light, group_entity)
+            light = group_entity
+            self.manager._last_adapted_group = group_entity
+        else:
+            self.manager._last_adapted_group = None
+
         data = await self.prepare_adaptation_data(
             light,
             transition,
@@ -1542,6 +1567,9 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         if lights is None:
             self._expand_light_groups()
             lights = self.lights
+
+        # Reset skipped-group adaptation dedup for this cycle
+        self.manager._last_adapted_group = None
 
         on_lights = [light for light in lights if is_on(self.hass, light)]
 
@@ -1821,8 +1849,8 @@ class SimpleSwitch(SwitchEntity, RestoreEntity):
         self._state = False
 
 
-type AdaptiveSwitches = list[AdaptiveSwitch]
-type AdaptiveSwitchMap = dict[AdaptiveSwitch, list[str]]
+AdaptiveSwitches = list[AdaptiveSwitch]
+AdaptiveSwitchMap = dict[AdaptiveSwitch, list[str]]
 
 
 class AdaptiveLightingManager:
@@ -1833,6 +1861,10 @@ class AdaptiveLightingManager:
         assert hass is not None
         self.hass = hass
         self.lights: set[str] = set()
+        # Track children of groups that opted out of expansion
+        self._skipped_group_children: dict[str, str] = {}
+        # Dedup tracker for skipped-group adaptations in a single cycle
+        self._last_adapted_group: str | None = None
 
         # Tracks 'light.turn_off' service calls
         self.turn_off_event: dict[str, Event] = {}

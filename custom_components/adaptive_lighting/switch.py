@@ -660,6 +660,10 @@ def _expand_light_groups(
                         children = list(
                             config_entry.data.get("entities", {}).keys()
                         )
+            # The group entity itself is the real adaptation target; children
+            # are tracked alongside it only so the manager can detect manual
+            # touches on them and redirect adaptation back to the group.
+            all_lights.add(light)
             all_lights.update(children)
             for child in children:
                 manager._skipped_group_children[child] = light
@@ -1127,6 +1131,16 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             all_lights,
             self._auto_reset_manual_control_time,
         )
+        # Children of a skipped group (e.g. Lightener members) are tracked by
+        # the manager for manual-control detection, but they are NOT direct
+        # adaptation targets -- only the group entity itself is. Excluding
+        # them here keeps this switch's periodic adapt loop (and its
+        # `manual_control` attribute) pointed at the group, not its members.
+        self.lights = [
+            light
+            for light in all_lights
+            if light not in self.manager._skipped_group_children
+        ]
 
     async def _setup_listeners(self, _: Event[NoEventData] | None = None) -> None:
         _LOGGER.debug("%s: Called '_setup_listeners'", self._name)

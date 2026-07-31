@@ -645,6 +645,21 @@ def _expand_light_groups(
             # Skipped group: expand to children for manual-control tracking,
             # but record mapping so adaptation can redirect to the group entity.
             children = state.attributes.get("entity_id", [])
+            if not children:
+                # Some group-like integrations (e.g. Lightener) don't expose
+                # their members via the entity_id state attribute like a
+                # standard HA light group does. Fall back to the config
+                # entry that created this entity, which lists its members.
+                ent_reg = entity_registry.async_get(hass)
+                entity_entry = ent_reg.async_get(light)
+                if entity_entry and entity_entry.config_entry_id:
+                    config_entry = hass.config_entries.async_get_entry(
+                        entity_entry.config_entry_id
+                    )
+                    if config_entry:
+                        children = list(
+                            config_entry.data.get("entities", {}).keys()
+                        )
             all_lights.update(children)
             for child in children:
                 manager._skipped_group_children[child] = light

@@ -1602,6 +1602,21 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
         on_lights = [light for light in lights if is_on(self.hass, light)]
 
+        # Clear stale turn_off events for lights that are currently on.
+        # Without this, a stale turn_off event (time_fired > turn_on) permanently
+        # blocks interval adaptation — see dual-daemon / skipped-group bug Aug 2026.
+        for light in on_lights:
+          turn_off = self.manager.turn_off_event.get(light)
+          turn_on = self.manager.turn_on_event.get(light)
+          if turn_off is not None and turn_on is not None:
+            if turn_off.time_fired > turn_on.time_fired:
+              _LOGGER.debug(
+                "%s: Clearing stale turn_off event for '%s' (light is on, turn_off was newer than turn_on)",
+                self._name,
+                light,
+              )
+              self.manager.turn_off_event.pop(light, None)
+
         if force:
             filtered_lights = on_lights
         else:

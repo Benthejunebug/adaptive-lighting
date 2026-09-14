@@ -626,6 +626,7 @@ def _expand_light_groups(
 ) -> list[str]:
     """Resolve nested groups without changing another profile's tracked targets."""
     all_lights: set[str] = set()
+    manager = hass.data[DOMAIN][ATTR_ADAPTIVE_LIGHTING_MANAGER]
     pending = list(lights)
     visited: set[str] = set()
     while pending:

@@ -1313,6 +1313,12 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         extra_state_attributes["manual_control"] = [
             light for light in tracked if self.manager.manual_control.get(light)
         ]
+        extra_state_attributes["manual_control_friendly_names"] = [
+            state.attributes.get("friendly_name", light)
+            if (state := self.hass.states.get(light)) is not None
+            else light
+            for light in extra_state_attributes["manual_control"]
+        ]
         extra_state_attributes["manual_control_brightness"] = [
             light
             for light in tracked

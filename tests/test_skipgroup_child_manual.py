@@ -234,6 +234,8 @@ async def test_p2_child_brightness_manual_detected_and_reported(hass: HomeAssist
     )
     assert "BRIGHTNESS" in _mc(manager, C1), "child brightness override NOT detected"
     assert C1 in attrs["manual_control"], "child override NOT reported in manual_control"
+    badge_names = hass.states.get(sw.entity_id).attributes["manual_control_friendly_names"]
+    assert badge_names == [hass.states.get(C1).attributes["friendly_name"]]
     assert C1 in attrs["manual_control_brightness"]
     assert C1 not in (attrs["manual_control_color"] or [])
     assert GROUP not in attrs["manual_control"], "group wrongly marked manual"

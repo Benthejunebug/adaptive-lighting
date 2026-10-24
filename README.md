@@ -1,7 +1,7 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge)](https://github.com/hacs/integration)
 ![Version](https://img.shields.io/github/v/release/basnijholt/adaptive-lighting?style=for-the-badge)
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-[![All Contributors](https://img.shields.io/badge/all_contributors-172-orange.svg?style=flat-square)](#contributors-)
+[![All Contributors](https://img.shields.io/badge/all_contributors-175-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
 # 🌞 Adaptive Lighting: Enhance Your Home's Atmosphere with Smart, Sun-Synchronized Lighting 🌙
@@ -84,6 +84,7 @@ The attributes are absent when the Adaptive Lighting switch is off. Use a fallba
 - [Additional Information](#additional-information)
 - [:sos: Troubleshooting](#sos-troubleshooting)
   - [:exclamation: Common Problems & Solutions](#exclamation-common-problems--solutions)
+    - [:bulb: Lights Only Adapt After Reloading](#bulb-lights-only-adapt-after-reloading)
     - [:bulb: Lights Not Responding or Turning On by Themselves](#bulb-lights-not-responding-or-turning-on-by-themselves)
     - [:signal_strength: WiFi Networks](#signal_strength-wifi-networks)
     - [:spider_web: Zigbee, Z-Wave, and Other Mesh Networks](#spider_web-zigbee-z-wave-and-other-mesh-networks)
@@ -762,6 +763,14 @@ represent one sent command or the current desired state.
 <!-- SECTION:common-problems:START -->
 ### :exclamation: Common Problems & Solutions
 
+#### :bulb: Lights Only Adapt After Reloading
+
+If lights stop adapting after you turn them on with a physical switch or a Zigbee-bound remote, check the Adaptive Lighting switch's `manual_control` attribute. With `take_over_control: true` and `detect_non_ha_changes: false`, a turn-on without a matching Home Assistant `light.turn_on` call marks the light as manually controlled. Reloading clears that state, but the next physical turn-on can trigger it again.
+
+To adapt these turn-ons while still detecting later manual changes, enable `detect_non_ha_changes` and leave `manual_control_on_external_turn_on` disabled. This requires the light integration to report its state reliably. If you want Adaptive Lighting to keep adapting regardless of manual changes, disable `take_over_control` along with the options that require it: `detect_non_ha_changes`, `adapt_only_on_bare_turn_on`, and `manual_control_on_external_turn_on`.
+
+This explains the physical-switch case in [#1056](https://github.com/basnijholt/adaptive-lighting/issues/1056), but not every report in that thread. If the light is not listed in `manual_control`, include diagnostics and debug logs from the failed turn-on when reporting it. Lights returning from `unavailable` after a power cut are a separate case from an `off` to `on` state change.
+
 #### :bulb: Lights Not Responding or Turning On by Themselves
 
 Adaptive Lighting sends more commands to lights than a typical human user would. If your light control network is unhealthy, you may experience:
@@ -1109,6 +1118,9 @@ Notice the values of `brightness_mode_time_light` and `brightness_mode_time_dark
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/hesseleo"><img src="https://avatars.githubusercontent.com/u/44778508?v=4?s=100" width="100px;" alt="Leonhard Hesse"/><br /><sub><b>Leonhard Hesse</b></sub></a><br /><a href="https://github.com/basnijholt/adaptive-lighting/commits?author=hesseleo" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="http://www.tim-maps.com"><img src="https://avatars.githubusercontent.com/u/6741938?v=4?s=100" width="100px;" alt="Tim Stallmann"/><br /><sub><b>Tim Stallmann</b></sub></a><br /><a href="https://github.com/basnijholt/adaptive-lighting/commits?author=timstallmann" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/lehneres"><img src="https://avatars.githubusercontent.com/u/7437288?v=4?s=100" width="100px;" alt="lehneres"/><br /><sub><b>lehneres</b></sub></a><br /><a href="#ideas-lehneres" title="Ideas, Planning, & Feedback">🤔</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ahmadtawakol"><img src="https://avatars.githubusercontent.com/u/2355493?v=4?s=100" width="100px;" alt="Ahmad Tawakol"/><br /><sub><b>Ahmad Tawakol</b></sub></a><br /><a href="https://github.com/basnijholt/adaptive-lighting/commits?author=ahmadtawakol" title="Code">💻</a> <a href="https://github.com/basnijholt/adaptive-lighting/issues?q=author%3Aahmadtawakol" title="Bug reports">🐛</a> <a href="#maintenance-ahmadtawakol" title="Maintenance">🚧</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/SGXander"><img src="https://avatars.githubusercontent.com/u/8619536?v=4?s=100" width="100px;" alt="SGXander"/><br /><sub><b>SGXander</b></sub></a><br /><a href="https://github.com/basnijholt/adaptive-lighting/commits?author=SGXander" title="Code">💻</a> <a href="https://github.com/basnijholt/adaptive-lighting/issues?q=author%3ASGXander" title="Bug reports">🐛</a> <a href="https://github.com/basnijholt/adaptive-lighting/commits?author=SGXander" title="Tests">⚠️</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://fezvrasta.github.io"><img src="https://avatars.githubusercontent.com/u/5382443?v=4?s=100" width="100px;" alt="Federico Zivolo"/><br /><sub><b>Federico Zivolo</b></sub></a><br /><a href="#translation-FezVrasta" title="Translation">🌍</a></td>
     </tr>
   </tbody>
   <tfoot>

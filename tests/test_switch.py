@@ -30,6 +30,7 @@ from homeassistant.components.adaptive_lighting.const import (
     ATTR_ADAPT_BRIGHTNESS,
     ATTR_ADAPT_COLOR,
     ATTR_ADAPTIVE_LIGHTING_MANAGER,
+    CONF_ADAPT_DELAY,
     CONF_ADAPT_ONLY_ON_BARE_TURN_ON,
     CONF_ADAPT_UNTIL_SLEEP,
     CONF_AUTORESET_CONTROL,
@@ -46,6 +47,7 @@ from homeassistant.components.adaptive_lighting.const import (
     CONF_MIN_BRIGHTNESS,
     CONF_MIN_COLOR_TEMP,
     CONF_MULTI_LIGHT_INTERCEPT,
+    CONF_ONLY_ONCE,
     CONF_PREFER_RGB_COLOR,
     CONF_RESET_MANUAL_CONTROL_ON_SLEEP_MODE_CHANGE,
     CONF_SEND_SPLIT_DELAY,
@@ -81,6 +83,7 @@ from homeassistant.components.adaptive_lighting.switch import (
     SimpleSwitch,
     _attributes_have_changed,
     _expand_light_groups,
+    _turn_off_transition,
     color_difference_redmean,
     create_context,
     is_our_context,
@@ -108,6 +111,9 @@ from homeassistant.const import (
     ATTR_AREA_ID,
     ATTR_DEVICE_ID,
     ATTR_ENTITY_ID,
+    ATTR_FLOOR_ID,
+    ATTR_LABEL_ID,
+    ATTR_SERVICE_DATA,
     ATTR_SUPPORTED_FEATURES,
     CONF_LIGHTS,
     CONF_NAME,
@@ -117,6 +123,7 @@ from homeassistant.const import (
     SERVICE_TURN_ON,
     STATE_OFF,
     STATE_ON,
+    STATE_UNAVAILABLE,
     EntityCategory,
 )
 from homeassistant.core import Context, CoreState, Event, HomeAssistant, State
@@ -1532,8 +1539,10 @@ async def test_apply_updates_non_ha_change_baseline(
         )
 
         direction = 1 if manual_value < adaptive_value else -1
+        # Legacy template lights round via mireds; 70 K keeps one reported step
+        # below 100 K and two steps above it across the configured range.
         small_change = (
-            15 if manual_attribute == LightControlAttributes.BRIGHTNESS else 60
+            15 if manual_attribute == LightControlAttributes.BRIGHTNESS else 70
         )
         freezer.tick(90)
         set_physical_state(manual_value + direction * small_change)
@@ -4256,6 +4265,27 @@ def _turn_on_service_event(entity_ids: list[str], ts: float, context: Context) -
     )
 
 
+def _turn_off_service_event(
+    entity_ids: list[str],
+    ts: float,
+    context: Context,
+    transition: float | str | None,
+) -> Event:
+    service_data = {ATTR_ENTITY_ID: entity_ids}
+    if transition is not None:
+        service_data[ATTR_TRANSITION] = transition
+    return Event(
+        EVENT_CALL_SERVICE,
+        {
+            "domain": LIGHT_DOMAIN,
+            "service": SERVICE_TURN_OFF,
+            "service_data": service_data,
+        },
+        time_fired_timestamp=ts,
+        context=context,
+    )
+
+
 async def test_just_turned_off_group_context_reuse(hass, cleanup):
     """Group 'off' → 'on' with a reused 'turn_off' context must still adapt.
 
@@ -4314,6 +4344,154 @@ async def test_just_turned_off_group_context_reuse(hass, cleanup):
     assert await manager.just_turned_off(group)
 
 
+def _register_mixed_target_lights(
+    hass,
+    device_registry,
+    floor_registry,
+    label_registry,
+):
+    """Assign the three test lights to mixed indirect HA targets."""
+    floor = floor_registry.async_create("Upstairs")
+    area_registry = ar.async_get(hass)
+    upstairs_area = area_registry.async_create(
+        "Upstairs room",
+        floor_id=floor.floor_id,
+    )
+    hall_area = area_registry.async_create("Hall")
+
+    config_entry = MockConfigEntry(domain="test")
+    config_entry.add_to_hass(hass)
+    device = device_registry.async_get_or_create(
+        config_entry_id=config_entry.entry_id,
+        identifiers={("test", "device-target")},
+    )
+    label = label_registry.async_create("Skipped light")
+
+    registry = entity_registry.async_get(hass)
+    registry.async_update_entity(ENTITY_LIGHT_1, area_id=upstairs_area.id)
+    registry.async_update_entity(ENTITY_LIGHT_2, area_id=hall_area.id)
+    registry.async_update_entity(
+        ENTITY_LIGHT_3,
+        device_id=device.id,
+        labels={label.label_id},
+    )
+    return {
+        ATTR_FLOOR_ID: floor.floor_id,
+        ATTR_AREA_ID: hall_area.id,
+        ATTR_DEVICE_ID: device.id,
+        ATTR_LABEL_ID: label.label_id,
+    }
+
+
+async def test_mixed_turn_off_targets_do_not_readapt_off_device_light(
+    hass,
+    device_registry,
+    floor_registry,
+    label_registry,
+    cleanup,
+):
+    """A mixed-target turn-off must cover an already-off device light (#1069)."""
+    await setup_lights(hass)
+    targets = _register_mixed_target_lights(
+        hass,
+        device_registry,
+        floor_registry,
+        label_registry,
+    )
+    targets.pop(ATTR_LABEL_ID)
+
+    _, switch = await setup_switch(
+        hass,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_1, ENTITY_LIGHT_2, ENTITY_LIGHT_3],
+            CONF_DETECT_NON_HA_CHANGES: True,
+            CONF_INTERCEPT: True,
+            CONF_INITIAL_TRANSITION: 0,
+        },
+    )
+    assert hass.states.is_state(ENTITY_LIGHT_3, STATE_OFF)
+
+    turn_off_context = Context()
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_OFF,
+        {
+            **targets,
+            ATTR_TRANSITION: 10,
+        },
+        blocking=True,
+        context=turn_off_context,
+    )
+    await hass.async_block_till_done()
+
+    calls = _track_adaptive_light_calls(hass)
+    off_state = hass.states.get(ENTITY_LIGHT_3)
+    assert off_state is not None
+    hass.states.async_set(
+        ENTITY_LIGHT_3,
+        STATE_ON,
+        off_state.attributes,
+        context=turn_off_context,
+    )
+    await hass.async_block_till_done()
+
+    assert not calls
+
+
+async def test_intercept_replaces_all_mixed_target_selectors(
+    hass,
+    device_registry,
+    floor_registry,
+    label_registry,
+    cleanup,
+):
+    """A narrowed intercepted call must not retain indirect target selectors."""
+    lights = await setup_lights(hass)
+    targets = _register_mixed_target_lights(
+        hass,
+        device_registry,
+        floor_registry,
+        label_registry,
+    )
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_OFF,
+        {
+            ATTR_ENTITY_ID: [ENTITY_LIGHT_1, ENTITY_LIGHT_2, ENTITY_LIGHT_3],
+        },
+        blocking=True,
+    )
+    await setup_switch(
+        hass,
+        {
+            CONF_LIGHTS: [ENTITY_LIGHT_1, ENTITY_LIGHT_2],
+            CONF_INTERCEPT: True,
+            CONF_MULTI_LIGHT_INTERCEPT: True,
+            CONF_INITIAL_TRANSITION: 0,
+            CONF_MIN_BRIGHTNESS: 50,
+            CONF_MAX_BRIGHTNESS: 50,
+        },
+    )
+
+    with patch.object(
+        lights[2],
+        "async_turn_on",
+        wraps=lights[2].async_turn_on,
+    ) as skipped_turn_on:
+        await hass.services.async_call(
+            LIGHT_DOMAIN,
+            SERVICE_TURN_ON,
+            {**targets, ATTR_BRIGHTNESS: 200},
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+
+    assert hass.states.get(ENTITY_LIGHT_1).attributes[ATTR_BRIGHTNESS] == 128
+    assert hass.states.get(ENTITY_LIGHT_2).attributes[ATTR_BRIGHTNESS] == 128
+    skipped_turn_on.assert_awaited_once()
+    assert skipped_turn_on.call_args.kwargs[ATTR_BRIGHTNESS] == 200
+
+
 async def test_just_turned_off_same_automation_context(hass, cleanup):
     """'turn_off' and 'turn_on' from one automation share a context.
 
@@ -4330,6 +4508,12 @@ async def test_just_turned_off_same_automation_context(hass, cleanup):
     now = dt_util.utcnow().timestamp()
     automation_context = Context()
 
+    manager.turn_off_event[ENTITY_LIGHT_1] = _turn_off_service_event(
+        [ENTITY_LIGHT_1],
+        now - 2,
+        automation_context,
+        transition=10,
+    )
     manager.on_to_off_event[ENTITY_LIGHT_1] = _state_changed_event(
         ENTITY_LIGHT_1,
         now - 2,
@@ -4367,6 +4551,133 @@ async def test_just_turned_off_same_automation_context(hass, cleanup):
         automation_context,
     )
     assert await manager.just_turned_off(ENTITY_LIGHT_1)
+
+    # A later physical turn-on has a fresh context and must not remain blocked by
+    # the old turn-off record after its transition window has elapsed.
+    manager.on_to_off_event[ENTITY_LIGHT_1] = _state_changed_event(
+        ENTITY_LIGHT_1,
+        now - 20,
+        automation_context,
+    )
+    manager.turn_off_event[ENTITY_LIGHT_1] = _turn_off_service_event(
+        [ENTITY_LIGHT_1],
+        now - 20,
+        automation_context,
+        transition=10,
+    )
+    manager.off_to_on_event[ENTITY_LIGHT_1] = _state_changed_event(
+        ENTITY_LIGHT_1,
+        now,
+        Context(),
+    )
+    assert not await manager.just_turned_off(ENTITY_LIGHT_1)
+
+
+@pytest.mark.parametrize(
+    ("transition", "window"),
+    [(10, 10), (10.0, 10), ("10", 10), ("10000", 6553), ("inf", 6553), (None, 5)],
+)
+async def test_just_turned_off_normalized_transition(hass, cleanup, transition, window):
+    """Both turn-off guards use coerced and clamped transition windows."""
+    await setup_lights(hass)
+    _, switch = await setup_switch(hass, {CONF_LIGHTS: [ENTITY_LIGHT_1]})
+    await hass.async_block_till_done()
+    manager = switch.manager
+
+    now = dt_util.utcnow().timestamp()
+    context = Context()
+    other_context = Context()
+
+    # Setting up the switch turns the light on, and that 'turn_on' would be read
+    # as the legitimate explanation for the 'off' → 'on' state changes below.
+    manager.turn_on_event.pop(ENTITY_LIGHT_1, None)
+
+    def set_events(turn_off_ts: float, off_to_on_context: Context) -> None:
+        manager.turn_off_event[ENTITY_LIGHT_1] = _turn_off_service_event(
+            [ENTITY_LIGHT_1],
+            turn_off_ts,
+            context,
+            transition=transition,
+        )
+        manager.on_to_off_event[ENTITY_LIGHT_1] = _state_changed_event(
+            ENTITY_LIGHT_1,
+            turn_off_ts,
+            other_context,
+        )
+        manager.off_to_on_event[ENTITY_LIGHT_1] = _state_changed_event(
+            ENTITY_LIGHT_1,
+            now,
+            off_to_on_context,
+        )
+
+    # A matching context is ignored within the normalized transition window.
+    set_events(now - window + 1, context)
+    assert await manager.just_turned_off(ENTITY_LIGHT_1)
+
+    # Past that window the same shape must stop matching.
+    set_events(now - window - 1, context)
+    assert not await manager.just_turned_off(ENTITY_LIGHT_1)
+
+    # `just_turned_off`'s own `max(transition, TURNING_OFF_DELAY)`: reached when
+    # the 'off' → 'on' state change carries a fresh context, so the check above
+    # returns early and the delay is computed from the 'on' → 'off' change.
+    manager.turn_off_event[ENTITY_LIGHT_1] = _turn_off_service_event(
+        [ENTITY_LIGHT_1],
+        now - window - 1,
+        context,
+        transition=transition,
+    )
+    manager.on_to_off_event[ENTITY_LIGHT_1] = _state_changed_event(
+        ENTITY_LIGHT_1,
+        now - window - 1,
+        context,
+    )
+    manager.off_to_on_event[ENTITY_LIGHT_1] = _state_changed_event(
+        ENTITY_LIGHT_1,
+        now,
+        Context(),
+    )
+    assert not await manager.just_turned_off(ENTITY_LIGHT_1)
+
+
+@pytest.mark.parametrize(
+    ("transition", "expected"),
+    [("2", 2.0), ("10000", 6553), ("inf", 6553), ("-2", 0), (None, None)],
+)
+async def test_turn_off_event_keeps_raw_transition(hass, cleanup, transition, expected):
+    """Normalize raw event data to the same transition used by the light service."""
+    await setup_lights(hass)
+    _, switch = await setup_switch(hass, {CONF_LIGHTS: [ENTITY_LIGHT_1]})
+    await hass.async_block_till_done()
+    manager = switch.manager
+
+    service_data = {ATTR_ENTITY_ID: ENTITY_LIGHT_1}
+    if transition is not None:
+        service_data[ATTR_TRANSITION] = transition
+    await hass.services.async_call(
+        LIGHT_DOMAIN,
+        SERVICE_TURN_OFF,
+        service_data,
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    event = manager.turn_off_event[ENTITY_LIGHT_1]
+    assert event.data[ATTR_SERVICE_DATA].get(ATTR_TRANSITION) == transition
+    assert _turn_off_transition(event) == expected
+
+    # A 'transition' that cannot be coerced is rejected by the schema, so it
+    # never reaches the listener.
+    manager.turn_off_event.pop(ENTITY_LIGHT_1)
+    with pytest.raises(voluptuous.error.MultipleInvalid):
+        await hass.services.async_call(
+            LIGHT_DOMAIN,
+            SERVICE_TURN_OFF,
+            {ATTR_ENTITY_ID: ENTITY_LIGHT_1, ATTR_TRANSITION: "not-a-number"},
+            blocking=True,
+        )
+    await hass.async_block_till_done()
+    assert ENTITY_LIGHT_1 not in manager.turn_off_event
 
 
 async def test_just_turned_off_group_context_reuse_end_to_end(hass, cleanup):
@@ -5104,7 +5415,27 @@ async def test_adapt_only_on_bare_turn_on_respects_pause_changed_mode(hass, inte
     )
 
 
-async def test_detect_non_ha_changes_with_separate_turn_on_commands(hass):
+@pytest.mark.parametrize(
+    ("repeat_bare_turn_on", "mode", "intercept"),
+    [
+        (False, TakeOverControlMode.PAUSE_ALL, False),
+        (False, TakeOverControlMode.PAUSE_CHANGED, False),
+        (True, TakeOverControlMode.PAUSE_ALL, True),
+        (True, TakeOverControlMode.PAUSE_CHANGED, True),
+    ],
+    ids=[
+        "direct-pause-all-reactive",
+        "direct-pause-changed-reactive",
+        "bare-turn-on-pause-all-intercept",
+        "bare-turn-on-pause-changed-intercept",
+    ],
+)
+async def test_detect_non_ha_changes_with_separate_turn_on_commands(
+    hass,
+    repeat_bare_turn_on,
+    mode,
+    intercept,
+):
     """Regression test for detect_non_ha_changes with separate_turn_on_commands.
 
     With separate_turn_on_commands=True, each adaptation cycle makes two sequential
@@ -5112,6 +5443,9 @@ async def test_detect_non_ha_changes_with_separate_turn_on_commands(hass):
     last_service_data instead of merging, brightness is dropped — and
     _attributes_have_changed silently skips the brightness comparison, so a direct
     Zigbee brightness change is never detected as manual control.
+
+    A repeated bare light.turn_on from an automation must not hide the physical
+    change before the periodic adaptation path runs.
     """
     switch, (light, *_) = await setup_lights_and_switch(
         hass,
@@ -5119,10 +5453,21 @@ async def test_detect_non_ha_changes_with_separate_turn_on_commands(hass):
             CONF_SEPARATE_TURN_ON_COMMANDS: True,
             CONF_DETECT_NON_HA_CHANGES: True,
             CONF_TAKE_OVER_CONTROL: True,
+            CONF_TAKE_OVER_CONTROL_MODE: mode,
+            CONF_INTERCEPT: intercept,
         },
     )
 
-    context = switch.create_context("test")
+    _mock_sun_light_settings(
+        switch,
+        {
+            ATTR_BRIGHTNESS_PCT: 50,
+            ATTR_COLOR_TEMP_KELVIN: 3000,
+            "force_rgb_color": False,
+        },
+    )
+
+    context = switch.create_context("interval")
 
     async def update(force: bool = False):
         await switch._update_attrs_and_maybe_adapt_lights(
@@ -5134,23 +5479,34 @@ async def test_detect_non_ha_changes_with_separate_turn_on_commands(hass):
 
     await update(force=True)
 
-    last_sd = switch.manager.last_service_data.get(ENTITY_LIGHT_1)
-    assert last_sd is not None, "last_service_data not set after force adapt"
-    assert (
-        ATTR_BRIGHTNESS in last_sd
-    ), f"brightness missing from last_service_data after split calls: {last_sd}"
-    assert (
-        ATTR_COLOR_TEMP_KELVIN in last_sd or ATTR_RGB_COLOR in last_sd
-    ), f"color missing from last_service_data after split calls: {last_sd}"
-
     al_brightness = light.brightness
     assert al_brightness is not None
+    al_color_temp = light.color_temp_kelvin
+    assert al_color_temp is not None
     switch.manager.manual_control[ENTITY_LIGHT_1] = LightControlAttributes.NONE
 
     manual_brightness = (
         al_brightness - 120 if al_brightness >= 120 else al_brightness + 120
     )
     set_light_brightness(light, manual_brightness)
+
+    if repeat_bare_turn_on:
+        await hass.services.async_call(
+            LIGHT_DOMAIN,
+            SERVICE_TURN_ON,
+            {ATTR_ENTITY_ID: light.entity_id},
+            blocking=True,
+        )
+        await hass.async_block_till_done()
+
+    _mock_sun_light_settings(
+        switch,
+        {
+            ATTR_BRIGHTNESS_PCT: 50,
+            ATTR_COLOR_TEMP_KELVIN: 4000,
+            "force_rgb_color": False,
+        },
+    )
 
     async def _flush_attr_state(hass, entity_id):
         """Mimic a ZHA attribute report: write current hardware state to HA."""
@@ -5161,20 +5517,15 @@ async def test_detect_non_ha_changes_with_separate_turn_on_commands(hass):
         new=AsyncMock(side_effect=_flush_attr_state),
     ):
         await update(force=False)
-
-        assert LightControlAttributes.BRIGHTNESS in switch.manager.manual_control.get(
-            ENTITY_LIGHT_1,
-            LightControlAttributes.NONE,
-        ), (
-            f"manual_control={switch.manager.manual_control.get(ENTITY_LIGHT_1)}, "
-            f"last_service_data={switch.manager.last_service_data.get(ENTITY_LIGHT_1)}"
-        )
-
         await update(force=False)
 
     assert (
         light.brightness == manual_brightness
-    ), f"AL overrode manual brightness {manual_brightness} with {al_brightness}"
+    ), f"AL overrode manual brightness {manual_brightness} with {light.brightness}"
+    expected_color_temp = (
+        4000 if mode == TakeOverControlMode.PAUSE_CHANGED else al_color_temp
+    )
+    assert light.color_temp_kelvin == expected_color_temp
 
 
 async def test_fresh_install_entity_ids(hass):
@@ -5756,3 +6107,245 @@ async def test_shared_profiles_keep_independent_sun_schedules(
     noon = hass.states.get(ENTITY_LIGHT_1)
     assert noon.attributes[ATTR_BRIGHTNESS] == 77
     assert noon.attributes[ATTR_COLOR_TEMP_KELVIN] > 2000
+
+
+@pytest.mark.parametrize("via_unavailable", [False, True])
+async def test_split_adaptation_cancelled_after_physical_off(
+    hass,
+    monkeypatch,
+    via_unavailable,
+):
+    """Pending split commands must not resurrect a physically switched-off light."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_DETECT_NON_HA_CHANGES: True,
+            CONF_ONLY_ONCE: True,
+            CONF_SEPARATE_TURN_ON_COMMANDS: True,
+            CONF_SEND_SPLIT_DELAY: 1234,
+            CONF_INITIAL_TRANSITION: 0,
+            CONF_MIN_BRIGHTNESS: 50,
+            CONF_MAX_BRIGHTNESS: 50,
+        },
+    )
+    state = hass.states.get(ENTITY_LIGHT_1)
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_OFF, state.attributes)
+    await hass.async_block_till_done()
+    # Isolate the split-command lifetime from the separate turn-off debounce.
+    monkeypatch.setattr(
+        switch.manager,
+        "just_turned_off",
+        AsyncMock(return_value=False),
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    async def controlled_sleep(delay, *args, **kwargs):
+        if delay == 1.234:
+            entered.set()
+            await release.wait()
+        else:
+            await original_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", controlled_sleep)
+    calls = _track_adaptive_light_calls(hass)
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_ON, state.attributes)
+    await asyncio.wait_for(entered.wait(), 2)
+    assert len(calls) == 1
+    if via_unavailable:
+        hass.states.async_set(ENTITY_LIGHT_1, STATE_UNAVAILABLE, state.attributes)
+        await original_sleep(0)
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_OFF, state.attributes)
+    await original_sleep(0)
+    release.set()
+    await hass.async_block_till_done()
+    assert len(calls) == 1, f"Physical OFF resurrected by split command: {calls}"
+    assert hass.states.get(ENTITY_LIGHT_1).state == STATE_OFF
+
+
+@pytest.mark.parametrize("remaining_profile", [False, True])
+async def test_profile_unloaded_during_adapt_delay(
+    hass,
+    monkeypatch,
+    remaining_profile,
+):
+    """A removed profile must not send commands after its adaptation delay."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_DETECT_NON_HA_CHANGES: True,
+            CONF_ONLY_ONCE: True,
+            CONF_ADAPT_DELAY: 0.1234,
+        },
+    )
+    if remaining_profile:
+        _, other = await setup_switch(
+            hass,
+            {
+                CONF_NAME: "remaining",
+                CONF_LIGHTS: [ENTITY_LIGHT_1],
+                CONF_ONLY_ONCE: True,
+                CONF_INITIAL_TRANSITION: 0,
+            },
+        )
+        await other.async_turn_off()
+    state = hass.states.get(ENTITY_LIGHT_1)
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_OFF, state.attributes)
+    await hass.async_block_till_done()
+    monkeypatch.setattr(
+        switch.manager,
+        "just_turned_off",
+        AsyncMock(return_value=False),
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    async def controlled_sleep(delay, *args, **kwargs):
+        if delay == 0.1234:
+            entered.set()
+            await release.wait()
+        else:
+            await original_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", controlled_sleep)
+    calls = _track_adaptive_light_calls(hass)
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_ON, state.attributes)
+    await asyncio.wait_for(entered.wait(), 2)
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    await hass.config_entries.async_unload(entry.entry_id)
+    calls.clear()
+    release.set()
+    await hass.async_block_till_done()
+    assert calls == []
+    if remaining_profile:
+        await other.async_turn_on()
+        await other._update_attrs_and_maybe_adapt_lights(
+            context=other.create_context("test"),
+            lights=[ENTITY_LIGHT_1],
+            force=True,
+        )
+        await hass.async_block_till_done()
+        assert calls
+        assert hass.states.get(ENTITY_LIGHT_1).state == STATE_ON
+
+
+async def test_profile_unloaded_during_split_delay(hass, monkeypatch):
+    """Removed profiles must not send remaining split commands."""
+    switch, _ = await setup_lights_and_switch(
+        hass,
+        {
+            CONF_DETECT_NON_HA_CHANGES: True,
+            CONF_ONLY_ONCE: True,
+            CONF_SEPARATE_TURN_ON_COMMANDS: True,
+            CONF_SEND_SPLIT_DELAY: 1234,
+            CONF_INITIAL_TRANSITION: 0,
+            CONF_MIN_BRIGHTNESS: 50,
+            CONF_MAX_BRIGHTNESS: 50,
+        },
+    )
+    state = hass.states.get(ENTITY_LIGHT_1)
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_OFF, state.attributes)
+    await hass.async_block_till_done()
+    # Isolate the split-command lifetime from the separate turn-off debounce.
+    monkeypatch.setattr(
+        switch.manager,
+        "just_turned_off",
+        AsyncMock(return_value=False),
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_sleep = asyncio.sleep
+
+    async def controlled_sleep(delay, *args, **kwargs):
+        if delay == 1.234:
+            entered.set()
+            await release.wait()
+        else:
+            await original_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", controlled_sleep)
+    calls = _track_adaptive_light_calls(hass)
+    hass.states.async_set(ENTITY_LIGHT_1, STATE_ON, state.attributes)
+    await asyncio.wait_for(entered.wait(), 2)
+    assert len(calls) == 1
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    release.set()
+    await hass.async_block_till_done()
+    assert len(calls) == 1
+    assert hass.states.get(ENTITY_LIGHT_1).state == STATE_ON
+
+
+@pytest.mark.parametrize("unload_before_split", [False, True])
+async def test_unloaded_polling_profile_preserves_other_split_adaptation(
+    hass,
+    monkeypatch,
+    unload_before_split,
+):
+    """A removed profile resuming a poll must not cancel another profile's work."""
+    switch, _ = await setup_lights_and_switch(hass, {CONF_ONLY_ONCE: True})
+    _, other = await setup_switch(
+        hass,
+        {
+            CONF_NAME: "remaining",
+            CONF_LIGHTS: [ENTITY_LIGHT_1],
+            CONF_ONLY_ONCE: True,
+            CONF_SEPARATE_TURN_ON_COMMANDS: True,
+            CONF_SEND_SPLIT_DELAY: 1234,
+            CONF_INITIAL_TRANSITION: 0,
+        },
+    )
+    poll_entered, poll_release = asyncio.Event(), asyncio.Event()
+    split_entered, split_release = asyncio.Event(), asyncio.Event()
+    original_update = switch.manager.update_manually_controlled_from_untracked_change
+    original_sleep = asyncio.sleep
+
+    async def delayed_update(profile, *args, **kwargs):
+        if profile is switch:
+            poll_entered.set()
+            await poll_release.wait()
+        await original_update(profile, *args, **kwargs)
+
+    async def controlled_sleep(delay, *args, **kwargs):
+        if delay == 1.234:
+            split_entered.set()
+            await split_release.wait()
+        else:
+            await original_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(
+        switch.manager,
+        "update_manually_controlled_from_untracked_change",
+        delayed_update,
+    )
+    monkeypatch.setattr(asyncio, "sleep", controlled_sleep)
+    calls = _track_adaptive_light_calls(hass)
+    polling = hass.async_create_task(
+        switch._update_attrs_and_maybe_adapt_lights(
+            context=switch.create_context("test"),
+            lights=[ENTITY_LIGHT_1],
+            force=True,
+        ),
+    )
+    await asyncio.wait_for(poll_entered.wait(), 2)
+    entry = hass.config_entries.async_entries(DOMAIN)[0]
+    if unload_before_split:
+        assert await hass.config_entries.async_unload(entry.entry_id)
+    adapting = hass.async_create_task(
+        other._adapt_light(
+            ENTITY_LIGHT_1,
+            other.create_context("test"),
+            0,
+            force=True,
+        ),
+    )
+    await asyncio.wait_for(split_entered.wait(), 2)
+    assert len(calls) == 1
+    if not unload_before_split:
+        assert await hass.config_entries.async_unload(entry.entry_id)
+    poll_release.set()
+    await polling
+    split_release.set()
+    await adapting
+    await hass.async_block_till_done()
+    assert len(calls) == 2
+    assert ATTR_COLOR_TEMP_KELVIN in calls[-1]

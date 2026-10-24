@@ -235,7 +235,12 @@ def is_our_context(context: Context | None, which: str | None = None) -> bool:
     """Check whether this integration created 'context'."""
     if context is None:
         return False
-    return is_our_context_id(context.id, which)
+    if is_our_context_id(context.id, which):
+        return True
+    # A context whose parent is one of ours is also ours: HA and integrations
+    # (e.g. Lightener) create a child context when they fan a call out while
+    # we are adapting. Such a call is not a user override.
+    return context.parent_id is not None and is_our_context_id(context.parent_id, which)
 
 
 def _switches_with_lights(
@@ -441,6 +446,13 @@ async def handle_apply_service(hass: HomeAssistant, service_call: ServiceCall) -
                 if switch.manager._skipped_group_children.get(light) not in skipped_groups
             ]
             switch.manager._last_adapted_group = None
+        child_targets = [
+            light for light in all_lights
+            if light in switch.manager._skipped_group_children
+        ]
+        if child_targets:
+            # An explicit child Apply resets only those children, not siblings.
+            switch.manager.reset(*child_targets)
         for light in all_lights:
             if data[CONF_TURN_ON_LIGHTS] or is_on(hass, light):
                 context = switch.create_context(
@@ -450,6 +462,14 @@ async def handle_apply_service(hass: HomeAssistant, service_call: ServiceCall) -
                 transition = data.get(CONF_TRANSITION)
                 if transition is None:
                     transition = switch.initial_transition
+                if light in child_targets:
+                    await switch._adapt_skipped_group_child(
+                        switch.manager._skipped_group_children[light],
+                        light, context, transition,
+                        data[ATTR_ADAPT_BRIGHTNESS], data[ATTR_ADAPT_COLOR],
+                        data[CONF_PREFER_RGB_COLOR], True,
+                    )
+                    continue
                 await switch._adapt_light(  # pylint: disable=protected-access
                     light,
                     context=context,
@@ -651,6 +671,31 @@ def _turn_off_transition(turn_off_event: Event) -> float | None:
     return VALID_TRANSITION(transition)
 
 
+def _lightener_children_from_registry(hass: HomeAssistant, light: str) -> list[str]:
+    """Return the members of a not-yet-loaded Lightener group.
+
+    Lightener creates one entity per group and keeps the group's members in
+    the owning `lightener` config entry (`data["entities"]`); the members are
+    NOT exposed as an `entity_id` state attribute. When the group entity does
+    not exist yet (Lightener has not been loaded yet at startup) the state
+    machine has nothing to inspect, so the config entry that owns the entity
+    is the only available source of the membership.
+    """
+    ent_reg = entity_registry.async_get(hass)
+    entity_entry = ent_reg.async_get(light)
+    if entity_entry is None or not entity_entry.config_entry_id:
+        return []
+    config_entry = hass.config_entries.async_get_entry(entity_entry.config_entry_id)
+    if config_entry is None or config_entry.domain != "lightener":
+        # Only Lightener groups have this membership layout; never guess for
+        # a config entry of another domain.
+        return []
+    entities = config_entry.data.get("entities")
+    if not isinstance(entities, dict):
+        return []
+    return [eid for eid in entities if isinstance(eid, str)]
+
+
 def _expand_light_groups(
     hass: HomeAssistant,
     lights: list[str],
@@ -667,8 +712,30 @@ def _expand_light_groups(
         visited.add(light)
         state = hass.states.get(light)
         if state is None:
-            _LOGGER.debug("State of %s is None", light)
-            all_lights.add(light)
+            # The entity does not exist (yet). This is the startup race: the
+            # group integration (e.g. Lightener) has not been loaded when
+            # Adaptive Lighting sets up, so there is no state to inspect.
+            # Discover the members from the owning config entry so the
+            # children are tracked for manual-control detection from the
+            # very first interaction, instead of only after a later lookup
+            # happens to re-expand the group.
+            children = _lightener_children_from_registry(hass, light)
+            if children:
+                # The group entity itself is the real adaptation target;
+                # children are tracked alongside it only so the manager can
+                # detect manual touches on them.
+                all_lights.add(light)
+                all_lights.update(children)
+                for child in children:
+                    manager._skipped_group_children[child] = light
+                _LOGGER.debug(
+                    "Expanded not-yet-loaded group %s to %s for tracking",
+                    light,
+                    children,
+                )
+            else:
+                _LOGGER.debug("State of %s is None", light)
+                all_lights.add(light)
         elif _is_light_group(state):
             group = state.attributes["entity_id"]
             pending.extend(group)
@@ -1512,7 +1579,11 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             self._send_split_delay / 1000.0,
             service_data,
             split=self._separate_turn_on_commands,
-            filter_by_state=self._skip_redundant_commands,
+            # Forced adaptations must reach the light even when the recorded
+            # state already matches the requested attributes, otherwise an
+            # explicit request (apply, turn-on, sleep-mode change) is silently
+            # dropped. Unforced adaptations keep the redundancy filter.
+            filter_by_state=self._skip_redundant_commands and not force,
             force=force,
             already_applied=already_applied,
         )
@@ -1911,7 +1982,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             await asyncio.sleep(self._adapt_delay)
 
         # Runtime settings may retire this profile's target while the event waits.
-        if self._removed or entity_id not in self.lights:
+        if self._removed or entity_id not in self._tracked_lights():
             return
 
         await self._update_attrs_and_maybe_adapt_lights(
@@ -2817,7 +2888,19 @@ class AdaptiveLightingManager:
 
     def reset(self, *lights: str, reset_manual_control: bool = True) -> None:
         """Reset the 'manual_control' status of the lights."""
+        # A skipped group (e.g. Lightener) is reset as a whole: clearing the
+        # group's manual state must also clear the manual state of the
+        # children that belong to *that* group, otherwise the group keeps
+        # being adapted child-by-child instead of through the single group
+        # command. Only the children of the given groups are touched, and
+        # only for this manager's own mapping. Clearing the manual-control
+        # flags itself still honours `reset_manual_control`.
+        targets = list(lights)
         for light in lights:
+            for child in _skipped_children_of(self, light):
+                if child not in targets:
+                    targets.append(child)
+        for light in targets:
             if reset_manual_control:
                 _LOGGER.debug(
                     "Light %s: Clearing manual control attributes.",
@@ -2832,7 +2915,7 @@ class AdaptiveLightingManager:
             self.last_service_data.pop(light, None)
             self.cancel_ongoing_adaptation_calls(light)
         if reset_manual_control:
-            self._schedule_manual_control_state_update(*lights)
+            self._schedule_manual_control_state_update(*targets)
 
     def remove_lights(self, *lights: str) -> None:
         """Retire tracking and pending work for targets no profile owns anymore."""
@@ -3288,8 +3371,18 @@ class AdaptiveLightingManager:
                 off_to_on_event,
             )
         turn_on_event: Event | None = self.turn_on_event.get(entity_id)
+        if turn_on_event is None:
+            return False
         id_off_to_on = off_to_on_event.context.id
-        return turn_on_event is not None and id_off_to_on == turn_on_event.context.id
+        parent_off_to_on = off_to_on_event.context.parent_id
+        return (
+            id_off_to_on == turn_on_event.context.id
+            or (parent_off_to_on is not None and parent_off_to_on == turn_on_event.context.id)
+            or (
+                turn_on_event.context.parent_id is not None
+                and id_off_to_on == turn_on_event.context.parent_id
+            )
+        )
 
     def _member_turn_on_explains_group_turn_on(
         self,

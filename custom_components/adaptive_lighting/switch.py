@@ -257,7 +257,7 @@ def _switches_with_lights(
     for switch in loaded_switches:
         switch._expand_light_groups()
         check_lights = switch._resolve_lights(lights) if expand_light_groups else lights
-        if set(switch.lights) & set(check_lights):
+        if set(switch._tracked_lights()) & set(check_lights):
             switches.append(switch)
     return switches
 
@@ -682,6 +682,33 @@ def _is_light_group(state: State) -> bool:
         "adaptive_lighting_skip_group", False
     )
     return is_group and not skip
+
+
+def _skipped_children_of(manager: AdaptiveLightingManager, group: str) -> list[str]:
+    """Children tracked for a skipped (non-expanded) group such as Lightener."""
+    return sorted(c for c, g in manager._skipped_group_children.items() if g == group)
+
+
+def _skipped_group_brightness_translator(hass: HomeAssistant, group: str, child: str):
+    """Return the group's own per-child brightness curve (Lightener) or None.
+
+    Duck-typed against LightenerLight._entities[*].translate_brightness so the
+    Lightener curve stays the single source of truth. None => do not adapt the
+    child's brightness directly (never fall back to AL's raw brightness).
+    """
+    try:
+        from homeassistant.helpers.entity_component import DATA_INSTANCES
+
+        component = hass.data.get(DATA_INSTANCES, {}).get(LIGHT_DOMAIN)
+    except ImportError:  # pragma: no cover
+        component = None
+    entity = component.get_entity(group) if component is not None else None
+    for controlled in getattr(entity, "_entities", None) or ():
+        if getattr(controlled, "entity_id", None) == child and hasattr(
+            controlled, "translate_brightness"
+        ):
+            return controlled.translate_brightness
+    return None
 
 
 def _supported_features(hass: HomeAssistant, light: str) -> set[str]:
@@ -1143,6 +1170,18 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             if light not in self.manager._skipped_group_children
         ]
 
+    def _tracked_lights(self) -> list[str]:
+        """Adaptation targets plus the children of this switch's skipped groups."""
+        groups = set(self.lights)
+        return sorted(
+            groups
+            | {
+                child
+                for child, group in self.manager._skipped_group_children.items()
+                if group in groups
+            }
+        )
+
     async def _setup_listeners(self, _: Event[NoEventData] | None = None) -> None:
         _LOGGER.debug("%s: Called '_setup_listeners'", self._name)
         if not self.is_on or not self.hass.is_running:
@@ -1254,18 +1293,19 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             for key in self._settings:
                 extra_state_attributes[key] = None
             return extra_state_attributes
+        tracked = self._tracked_lights()
         extra_state_attributes["manual_control"] = [
-            light for light in self.lights if self.manager.manual_control.get(light)
+            light for light in tracked if self.manager.manual_control.get(light)
         ]
         extra_state_attributes["manual_control_brightness"] = [
             light
-            for light in self.lights
+            for light in tracked
             if self.manager.manual_control.get(light, LightControlAttributes.NONE)
             & LightControlAttributes.BRIGHTNESS
         ]
         extra_state_attributes["manual_control_color"] = [
             light
-            for light in self.lights
+            for light in tracked
             if self.manager.manual_control.get(light, LightControlAttributes.NONE)
             & LightControlAttributes.COLOR
         ]
@@ -1273,7 +1313,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         timers = self.manager.auto_reset_manual_control_timers
         extra_state_attributes["autoreset_time_remaining"] = {
             light: time
-            for light in self.lights
+            for light in tracked
             if (timer := timers.get(light)) and (time := timer.remaining_time()) > 0
         }
         return extra_state_attributes
@@ -1339,6 +1379,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         force: bool = False,
         context: Context | None = None,
         already_applied: LightControlAttributes = LightControlAttributes.NONE,
+        brightness_map=None,
     ) -> AdaptationData | None:
         """Prepare `AdaptationData` for adapting a light."""
         adaptation_attributes = self.manager.get_adaption_control_attributes(
@@ -1383,6 +1424,8 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
         if "brightness" in features and adapt_brightness:
             brightness = round(255 * self._settings["brightness_pct"] / 100)
+            if brightness_map is not None:
+                brightness = brightness_map(brightness)
             service_data[ATTR_BRIGHTNESS] = brightness
 
         sleep_rgb = (
@@ -1449,17 +1492,31 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             _LOGGER.debug("%s: '%s' is locked", self._name, light)
             return
 
-        # If this light is a child of a skipped group, redirect adaptation to the group entity.
-        # This preserves the group's internal brightness curves (e.g. Lightener).
-        if light in self.manager._skipped_group_children:
-            group_entity = self.manager._skipped_group_children[light]
-            # Avoid redundant group adaptations in the same cycle
-            if hasattr(self.manager, '_last_adapted_group') and self.manager._last_adapted_group == group_entity:
-                _LOGGER.debug("Skipping redundant adaptation for %s (group %s already adapted)", light, group_entity)
+        # Skipped groups (Lightener): adapt through the group while no child is
+        # overridden (Lightener curves). Once any child has a manual override, a
+        # group command would fan out to that child too, so adapt each child
+        # directly with the group's own curve and the child's remaining axes.
+        group_entity = self.manager._skipped_group_children.get(light)
+        if group_entity is None and light in self.manager._skipped_group_children.values():
+            group_entity = light
+        if group_entity is not None:
+            children = _skipped_children_of(self.manager, group_entity)
+            overridden = any(
+                self.manager.get_manual_control_attributes(c).has_any() for c in children
+            )
+            if not overridden:
+                if light != group_entity and self.manager._last_adapted_group == group_entity:
+                    return
+                light = group_entity
+                self.manager._last_adapted_group = group_entity
+            else:
+                targets = children if light == group_entity else [light]
+                for child in targets:
+                    await self._adapt_skipped_group_child(
+                        group_entity, child, context, transition,
+                        adapt_brightness, adapt_color, prefer_rgb_color, force,
+                    )
                 return
-            _LOGGER.debug("Redirecting adaptation of %s to skipped group %s", light, group_entity)
-            light = group_entity
-            self.manager._last_adapted_group = group_entity
         else:
             self.manager._last_adapted_group = None
 
@@ -1476,6 +1533,53 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             return  # nothing to adapt
 
         await self.execute_cancellable_adaptation_calls(data)
+
+    async def _adapt_skipped_group_child(
+        self,
+        group: str,
+        child: str,
+        context: Context,
+        transition: int | None,
+        adapt_brightness: bool | None,
+        adapt_color: bool | None,
+        prefer_rgb_color: bool | None,
+        force: bool,
+    ) -> None:
+        """Adapt one child of a skipped group directly, honouring its overrides."""
+        allowed = self.manager.get_adaption_control_attributes(self, child)
+        if allowed.has_none():
+            return
+        translator = _skipped_group_brightness_translator(self.hass, group, child)
+        want_b = (
+            LightControlAttributes.BRIGHTNESS in allowed
+            if adapt_brightness is None
+            else adapt_brightness and LightControlAttributes.BRIGHTNESS in allowed
+        ) and translator is not None
+        want_c = (
+            LightControlAttributes.COLOR in allowed
+            if adapt_color is None
+            else adapt_color and LightControlAttributes.COLOR in allowed
+        )
+        child_on = is_on(self.hass, child)
+        if want_b:
+            group_b = round(255 * self._settings["brightness_pct"] / 100)
+            if translator(group_b) == 0:
+                if child_on:  # mirror Lightener: curve level 0 means off
+                    await self.hass.services.async_call(
+                        LIGHT_DOMAIN, SERVICE_TURN_OFF, {ATTR_ENTITY_ID: child},
+                        context=context,
+                    )
+                return
+        if not child_on and not want_b:
+            return  # only the curve may bring an un-overridden child back on
+        if not want_b and not want_c:
+            return
+        data = await self.prepare_adaptation_data(
+            child, transition, want_b, want_c, prefer_rgb_color,
+            force or not child_on, context, brightness_map=translator,
+        )
+        if data is not None:
+            await self.execute_cancellable_adaptation_calls(data)
 
     async def _execute_adaptation_calls(self, data: AdaptationData) -> None:
         """Executes a sequence of adaptation service calls for the given service datas."""
@@ -2516,7 +2620,7 @@ class AdaptiveLightingManager:
             if entry_data is None:
                 continue
             switch = entry_data.get(SWITCH_DOMAIN)
-            if switch is not None and set(lights).intersection(switch.lights):
+            if switch is not None and set(lights).intersection(switch._tracked_lights()):
                 switch.async_schedule_update_ha_state()
 
     def add_manual_control_attributes(
@@ -2736,6 +2840,19 @@ class AdaptiveLightingManager:
         )
         return []
 
+    def _is_skipped_group_fanout(self, child: str, context: Context) -> bool:
+        group = self._skipped_group_children.get(child)
+        if group is None or context is None:
+            return False
+        return any(
+            ev is not None and ev.context.id == context.id
+            for ev in (
+                self.turn_on_event.get(group),
+                self.turn_off_event.get(group),
+                self.toggle_event.get(group),
+            )
+        )
+
     async def turn_on_off_event_listener(self, event: Event) -> None:
         """Track 'light.turn_off' and 'light.turn_on' service calls."""
         domain = event.data.get(ATTR_DOMAIN)
@@ -2764,6 +2881,8 @@ class AdaptiveLightingManager:
             # where adapt_only_on_bare_turn_on can mark lights as manually controlled.
             # Fix for https://github.com/basnijholt/adaptive-lighting/issues/1378
             state = self.hass.states.get(eid)
+            if self._is_skipped_group_fanout(eid, event.context):
+                state = None  # group-level call; the group entity carries it
             if state is not None and state.state == STATE_ON:
                 switches = _switches_with_lights(
                     self.hass,
@@ -2908,6 +3027,17 @@ class AdaptiveLightingManager:
             # Tracks 'on' → 'off' state changes
             self.on_to_off_event[entity_id] = event
             self.reset(entity_id)
+            if (
+                entity_id in self._skipped_group_children
+                and not is_our_context(event.context)
+                and not self._is_skipped_group_fanout(entity_id, event.context)
+            ):
+                for switch in _switches_with_lights(
+                    self.hass, [entity_id], expand_light_groups=False
+                ):
+                    if switch.is_on and switch._take_over_control:
+                        self.set_manual_control_attributes(entity_id)
+                        switch.fire_manual_control_event(entity_id, event.context)
             _LOGGER.debug(
                 "Detected an 'on' → 'off' event for '%s' with context.id='%s'",
                 entity_id,
@@ -2932,7 +3062,13 @@ class AdaptiveLightingManager:
                 # Note: the reset below already happened in `_service_interceptor_turn_on_handler`
                 return
 
-            self.reset(entity_id, reset_manual_control=False)
+            if entity_id in self._skipped_group_children:
+                if self._is_skipped_group_fanout(entity_id, event.context):
+                    return  # the group's own off->on handles adaptation
+                # Rejoin on a bare turn-on; non-bare is re-marked below.
+                self.reset(entity_id, reset_manual_control=True)
+            else:
+                self.reset(entity_id, reset_manual_control=False)
             lock = self.turn_off_locks.setdefault(entity_id, asyncio.Lock())
             async with lock:
                 if await self.just_turned_off(entity_id):

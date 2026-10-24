@@ -366,3 +366,24 @@ async def test_p8_child_back_on_bare_rejoins_group_path(hass: HomeAssistant) -> 
     assert "BRIGHTNESS" in marked_after_off, "external child off not recorded as override"
     assert "BRIGHTNESS" not in _mc(manager, C3) and "COLOR" not in _mc(manager, C3)
     assert ours and all(c["entity_id"] == [GROUP] for c in ours), "did not return to single group command"
+
+
+@pytest.mark.parametrize("turn_on_lights", [False, True])
+async def test_apply_clears_group_and_child_overrides(hass: HomeAssistant, turn_on_lights: bool) -> None:
+    sw, manager, _ = await _setup(hass)
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": C1, "brightness": 120}, blocking=True, context=Context()
+    )
+    await hass.services.async_call(
+        "light", "turn_on", {"entity_id": GROUP, "brightness": 140}, blocking=True, context=Context()
+    )
+    await hass.async_block_till_done()
+    assert manager.manual_control.get(C1)
+    calls = _calls_recorder(hass)
+    await hass.services.async_call(
+        DOMAIN, "apply", {"entity_id": sw.entity_id, "lights": [GROUP], "turn_on_lights": turn_on_lights}, blocking=True
+    )
+    await hass.async_block_till_done()
+    assert not _attrs(hass, sw)["manual_control"], "Apply did not clear manual overrides"
+    ours = _ours_targets(calls)
+    assert ours and all(c["entity_id"] == [GROUP] for c in ours), "Apply must restore group curves without duplicate child dispatch"

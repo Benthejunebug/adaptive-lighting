@@ -422,6 +422,22 @@ async def handle_apply_service(hass: HomeAssistant, service_call: ServiceCall) -
     for switch in switches:
         all_lights = switch._resolve_lights(lights or None)
         switch.manager.lights.update(all_lights)
+        # Applying a skipped Lightener group is the explicit resync action:
+        # clear its members' overrides before choosing group/child routing.
+        # Dispatch only the group, letting Lightener restore its own curves.
+        skipped_groups = set(all_lights) & set(
+            switch.manager._skipped_group_children.values()
+        )
+        if skipped_groups:
+            reset_lights = set(skipped_groups)
+            for group in skipped_groups:
+                reset_lights.update(_skipped_children_of(switch.manager, group))
+            switch.manager.reset(*reset_lights)
+            all_lights = [
+                light for light in all_lights
+                if switch.manager._skipped_group_children.get(light) not in skipped_groups
+            ]
+            switch.manager._last_adapted_group = None
         for light in all_lights:
             if data[CONF_TURN_ON_LIGHTS] or is_on(hass, light):
                 context = switch.create_context(
